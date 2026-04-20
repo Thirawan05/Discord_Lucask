@@ -5,9 +5,7 @@ import yt_dlp
 from datetime import datetime
 import asyncio
 
-
 from myserver import server_on
-
 
 MAIN_CHANNEL_ID = 1414923035864993884
 ADMIN_IDS = [1424617349306253414, 1252736935680540695, 1290736050204835913]
@@ -18,7 +16,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ------------------ 🎵 เล่นเพลง ------------------
+# ------------------ 🎵 CONFIG ------------------
 
 ytdl_format_options = {
     'format': 'bestaudio',
@@ -32,11 +30,61 @@ ffmpeg_options = {
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 
+# ------------------ 🎶 MUSIC QUEUE ------------------
+
+music_queue = []
+is_playing = False
+
+async def play_next(ctx):
+    global is_playing
+
+    if len(music_queue) == 0:
+        is_playing = False
+        return
+
+    is_playing = True
+    url = music_queue.pop(0)
+
+    loop = asyncio.get_event_loop()
+    info = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+
+    if 'url' not in info:
+        await ctx.send("❌ โหลดเพลงไม่ได้")
+        return
+
+    stream_url = info['url']
+
+    vc = ctx.voice_client
+
+    def after_play(error):
+        if error:
+            print(error)
+        fut = asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+        try:
+            fut.result()
+        except:
+            pass
+
+    vc.play(discord.FFmpegPCMAudio(stream_url, **ffmpeg_options), after=after_play)
+
+# ------------------ 💬 COOLDOWN ------------------
+
+last_reply = {}
+
+def can_reply(user_id, cooldown=5):
+    now = datetime.now().timestamp()
+    if user_id not in last_reply or now - last_reply[user_id] > cooldown:
+        last_reply[user_id] = now
+        return True
+    return False
+
 # ------------------ 📊 INVITE SYSTEM ------------------
 
 invites_cache = {}
 invite_counts = {}
 joined_users = {}
+
+# ------------------ READY ------------------
 
 @bot.event
 async def on_ready():
@@ -46,53 +94,46 @@ async def on_ready():
         invites = await guild.invites()
         invites_cache[guild.id] = {invite.code: invite.uses for invite in invites}
 
-# ------------------ 💬 MESSAGE ------------------
+# ------------------ MESSAGE ------------------
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # 🎵 เล่นเพลง
-    if "youtube.com" in message.content or "youtu.be" in message.content:
+    # 🎵 ตรวจลิงก์ youtube
+    if "youtube.com/watch" in message.content or "youtu.be/" in message.content:
         if message.author.voice:
             channel = message.author.voice.channel
-            vc = discord.utils.get(bot.voice_clients, guild=message.guild)
+            vc = message.guild.voice_client
 
             if not vc:
                 vc = await channel.connect()
             elif vc.channel != channel:
                 await vc.move_to(channel)
 
-            info = ytdl.extract_info(message.content, download=False)
-            url = info['url']
+            music_queue.append(message.content)
 
-            def after_play(error):
-                if error:
-                    print(f"เกิดข้อผิดพลาด: {error}")
-                if vc.is_connected():
-                    coro = vc.disconnect()
-                    asyncio.run_coroutine_threadsafe(coro, bot.loop)
+            if not vc.is_playing() and not is_playing:
+                await play_next(message.channel)
+            else:
+                await message.channel.send("➕ เพิ่มเพลงเข้าคิวแล้ว")
 
-            if vc.is_playing():
-                vc.stop()
-
-            vc.play(discord.FFmpegPCMAudio(url, **ffmpeg_options), after=after_play)
-
-            await message.channel.send("🎶 กำลังเล่นเพลงให้แล้ว")
         else:
             await message.channel.send("❌ เข้า VC ก่อน")
 
-    # 💬 คำพูดเล่น
+    # 💬 คำพูดเล่น (มี cooldown)
     if "ลูคัส" in message.content:
-        await message.channel.send("ครับ")
+        if can_reply(message.author.id):
+            await message.channel.send("ครับ")
 
     if "สบายดีไหม" in message.content:
-        await message.channel.send("สบายดีครับ")
+        if can_reply(message.author.id):
+            await message.channel.send("สบายดีครับ")
 
     await bot.process_commands(message)
 
-# ------------------ 👋 คนเข้า ------------------
+# ------------------ 👋 JOIN ------------------
 
 @bot.event
 async def on_member_join(member):
@@ -120,15 +161,20 @@ async def on_member_join(member):
 
     inviter_name = inviter.name if inviter else "ไม่ทราบ"
 
-    # เพิ่มคะแนน
     if inviter:
         invite_counts[inviter.id] = invite_counts.get(inviter.id, 0) + 1
         joined_users[member.id] = inviter.id
 
-    # DM แอดมิน
+    # ✅ ลดการยิง API
     for admin_id in ADMIN_IDS:
+        user = bot.get_user(admin_id)
+        if not user:
+            try:
+                user = await bot.fetch_user(admin_id)
+            except:
+                continue
+
         try:
-            user = await bot.fetch_user(admin_id)
             await user.send(
                 f"📥 มีคนเข้าใหม่\n"
                 f"👤 ชื่อ: {member.name}\n"
@@ -138,7 +184,7 @@ async def on_member_join(member):
         except:
             pass
 
-# ------------------ ❌ คนออก ------------------
+# ------------------ ❌ LEAVE ------------------
 
 @bot.event
 async def on_member_remove(member):
@@ -148,7 +194,7 @@ async def on_member_remove(member):
         invite_counts[inviter_id] = max(invite_counts.get(inviter_id, 1) - 1, 0)
         del joined_users[member.id]
 
-# ------------------ 🏆 leaderboard ------------------
+# ------------------ 🏆 COMMAND ------------------
 
 @bot.command()
 async def invites(ctx):
@@ -160,11 +206,15 @@ async def invites(ctx):
 
     text = "🏆 อันดับคนเชิญ:\n"
     for i, (user_id, count) in enumerate(sorted_invites[:10], start=1):
-        user = await bot.fetch_user(user_id)
+        user = bot.get_user(user_id)
+        if not user:
+            user = await bot.fetch_user(user_id)
+
         text += f"{i}. {user.name} - {count} คน\n"
 
     await ctx.send(text)
 
-server_on()
+# ------------------ START ------------------
 
+server_on()
 bot.run(os.getenv('TOKEN'))
